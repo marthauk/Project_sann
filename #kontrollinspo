@@ -1,0 +1,994 @@
+import  std.algorithm,
+        std.array,
+        std.concurrency,
+        std.conv,
+        std.datetime,
+        std.file,
+        std.format,
+        std.getopt,
+        std.random,
+        std.range,
+        std.stdio;
+
+import  peers,
+        udp_bcast,
+        elevio,
+        elevator_state,
+        orders,
+        timer_event;
+
+
+
+
+enum HallOrderState {
+    unknown,
+    inactive,
+    pendingAck,
+    confirmed
+}
+
+struct HallOrder {
+    HallOrderState state;
+    ubyte[] ackdBy;
+}
+
+struct HallOrderMsg {
+    this(ubyte owner, HallOrder[2][] orders){
+        this.owner = owner;
+
+        auto o = new HallOrder[][](orders.length, 2);
+        foreach(floor, a; orders){
+            foreach(i, order; a){
+                o[floor][i] = HallOrder(
+                    orders[floor][i].state,
+                    orders[floor][i].ackdBy.dup
+                );
+            }
+        }
+        this._orders = cast(shared)o;
+    }
+
+    ubyte owner;
+    shared HallOrder[][] _orders;
+
+    HallOrder[2][] orders(){
+        auto o = new HallOrder[2][](_orders.length);
+        foreach(floor, a; _orders){
+            foreach(i, order; a){
+                o[floor][i] = HallOrder(
+                    _orders[floor][i].state,
+                    cast(ubyte[])_orders[floor][i].ackdBy
+                );
+            }
+        }
+        return o;
+    }
+}
+
+struct ElevatorStateMsg {
+    this(ElevatorState state, ubyte id){
+        this.state = cast(shared)ElevatorState(
+            state.behaviour,
+            state.floor,
+            state.dirn,
+            state.cabOrders.dup
+        );
+        this.id = id;
+    }
+    shared ElevatorState state;
+    ubyte id;
+}
+
+
+struct NewConfirmedHallOrder {
+    int floor;
+    Call call;
+}
+
+
+
+struct DoorClose {}
+
+struct FloorArrivalTimeout {}
+
+struct BroadcastHallOrders {}
+struct BroadcastState {}
+
+struct StateRestoreRequest {
+    ubyte asker;
+}
+struct StateRestoreInfo {
+    this(ElevatorState state, ubyte belongsTo){
+        this.state = cast(shared)ElevatorState(
+            state.behaviour,
+            state.floor,
+            state.dirn,
+            state.cabOrders.dup
+        );
+        this.belongsTo = belongsTo;
+    }
+    shared ElevatorState state;
+    ubyte belongsTo;
+}
+
+
+
+void print(HallOrder[2][] h){
+    auto ackdByStrs = h.map!(a => a.array.map!(b => format("%(%3d, %)", b.ackdBy.sort())));
+    auto maxAckdByStrLens = ackdByStrs.map!(a => a.map!(b => b.length).array).reduce!max;
+
+    foreach_reverse(floor, a; h){
+        write("  ", floor);
+        foreach(call, order; a){
+            writef("  |  %10s : %-*s", order.state, maxAckdByStrLens[call], ackdByStrs[floor][call]);
+        }
+        writeln;
+    }
+}
+
+
+private __gshared int       doorOpenDuration_ms             = 3000;
+private __gshared Duration  doorOpenDuration                = 3000.msecs;
+private __gshared int       travelTimeEstimate_ms           = 2500;
+private __gshared Duration  travelTimeEstimate              = 2500.msecs;
+private __gshared int       bcastStatePeriod_ms             = 50;
+private __gshared Duration  bcastStatePeriod;
+private __gshared int       bcastHallOrdersPeriodMin_ms     = 30;
+private __gshared int       bcastHallOrdersPeriodMax_ms     = 60;
+
+
+/+
+State functions
+    moving_enter
+        set motor direction
+        start floor arrival timeout timer
+    moving_exit
+        stop motor
+    doorOpen_enter
+        open door
+        start timer
+    doorOpen_exit
+        close door
+    idle_enter
+    idle_exit
+        
++/
+
+
+
+void main(){
+    {
+        string[] configContents;
+        try {
+            configContents = readText("elevator.con").split;
+            getopt( configContents,
+                std.getopt.config.passThrough,
+                "eventloop_doorOpenDuration",           &doorOpenDuration_ms,
+                "eventloop_travelTimeEstimate",         &travelTimeEstimate_ms,
+                "eventloop_bcastStatePeriod",           &bcastStatePeriod_ms,
+                "eventloop_bcastHallOrdersPeriodMin",   &bcastHallOrdersPeriodMin_ms,
+                "eventloop_bcastHallOrdersPeriodMax",   &bcastHallOrdersPeriodMax_ms,
+            );
+        } catch(Exception e){
+            writeln("Unable to load eventloop config:\n", e.msg);
+        }
+        doorOpenDuration    = doorOpenDuration_ms.msecs;
+        travelTimeEstimate  = travelTimeEstimate_ms.msecs;
+        bcastStatePeriod    = bcastStatePeriod_ms.msecs;
+    }
+
+
+
+    writeln("Started");
+
+
+    elevio.init(thisTid);
+    Tid peerTx  = peers.init(thisTid);
+    ubyte id    = peers.id;
+    Tid bcast   = udp_bcast.init!(
+                    HallOrderMsg,
+                    ElevatorStateMsg,
+                    StateRestoreRequest,
+                    StateRestoreInfo
+                  )(id, thisTid);
+
+    HallOrder[2][]          hallOrders  = new HallOrder[2][](numFloors);
+    ElevatorState[ubyte]    states;
+    ubyte[]                 peers;
+
+
+
+    {
+        auto floor = floorSensor();
+        if(floor != -1){
+            states[id] = ElevatorState(
+                ElevatorBehaviour.idle,
+                floor,
+                Dirn.stop,
+                new bool[](numFloors),
+            );
+            floorIndicator(floor);
+        } else {
+            states[id] = ElevatorState(
+                ElevatorBehaviour.moving,
+                -1,
+                Dirn.down,
+                new bool[](numFloors),
+            );
+            motorDirection(Dirn.down);
+            thisTid.addEvent(2*travelTimeEstimate, FloorArrivalTimeout());
+        }
+    }
+
+    thisTid.addEvent(bcastHallOrdersPeriodMin_ms.msecs, BroadcastHallOrders());
+    thisTid.addEvent(bcastStatePeriod, BroadcastState(), Yes.periodic);
+    bcast.send(StateRestoreRequest(id));
+
+    while(true){
+        receive(
+
+            // ---  --- //
+
+            (CallButton cb){
+                writeln("\n  Event: ", cb);
+
+                final switch(cb.call) with(Call){
+                case hallUp, hallDown:
+
+                    final switch(hallOrders[cb.floor][cb.call].state) with(HallOrderState){
+                    case unknown, inactive:
+                        hallOrders[cb.floor][cb.call].state = pendingAck;
+                        hallOrders[cb.floor][cb.call].ackdBy = [id];
+                        debug(hallOrders){
+                            writeln(" New order: ", cb.floor, " ", cb.call);
+                            hallOrders.print;
+                        }
+                        break;
+                    case pendingAck, confirmed:
+                        break;
+                    }
+                    break;
+
+                case cab:
+                    final switch(states[id].behaviour) with(ElevatorBehaviour){
+                    case idle:
+                        if(states[id].floor == cb.floor){
+                            doorLight(true);
+                            addEvent(thisTid, doorOpenDuration, DoorClose());
+                            states[id].behaviour = doorOpen;
+                        } else {
+                            // TODO: check if we can call "moveIfOrdersAvailable"
+                            states[id].cabOrders[cb.floor] = true;
+                            callButtonLight(cb.floor, cab, true);
+                            states[id].dirn = chooseDirection(
+                                optimalOrders(states, hallOrders, peers, id),
+                                states[id].floor,
+                                states[id].dirn
+                            );
+                            //assert(states[id].dirn != Dirn.stop);
+                            motorDirection(states[id].dirn);
+                            thisTid.addEvent(2*travelTimeEstimate, FloorArrivalTimeout());
+                            states[id].behaviour = moving;
+                        }
+                        break;
+
+                    case moving, errStuckBetweenFloors:
+                        states[id].cabOrders[cb.floor] = true;
+                        callButtonLight(cb.floor, cab, true);
+                        break;
+
+                    case doorOpen:
+                        if(states[id].floor == cb.floor){
+                            deleteEvent(thisTid, typeid(DoorClose), Delete.all);
+                            addEvent(thisTid, doorOpenDuration, DoorClose());
+                        } else {
+                            states[id].cabOrders[cb.floor] = true;
+                            callButtonLight(cb.floor, cab, true);
+                        }
+                        break;
+                    }
+
+                    break;
+                }
+
+            },
+            (FloorSensor f){
+                writeln("\n  Event: FloorSensor(", f, ")");
+                floorIndicator(f);
+                thisTid.deleteEvent(typeid(FloorArrivalTimeout), Delete.all);
+
+                final switch(states[id].behaviour) with(ElevatorBehaviour){
+                case moving:
+                    auto orders = optimalOrders(states, hallOrders, peers, id/+, Yes.arriving+/);
+                    if(shouldStop(orders, f, states[id].dirn)){
+                        motorDirection(Dirn.stop);
+                        doorLight(true);
+
+                        clearAt(orders, f, (Call c){
+                            final switch(c) with(Call){
+                            case hallUp, hallDown:
+                                hallOrders[f][c].state = HallOrderState.inactive;
+                                hallOrders[f][c].ackdBy.destroy;
+                                debug(hallOrders){
+                                    writeln(" Cleared order: ", f, " ", c);
+                                    hallOrders.print;
+                                }
+                                break;
+                            case cab:
+                                states[id].cabOrders[f] = false;
+                                break;
+                            }
+                            callButtonLight(f, c, false);
+                        });
+
+                        thisTid.addEvent(doorOpenDuration, DoorClose());
+                        states[id].behaviour = doorOpen;
+                    } else {
+                        thisTid.addEvent(2*travelTimeEstimate, FloorArrivalTimeout());
+                    }
+
+                    break;
+                case errStuckBetweenFloors:
+                    peerTx.send(TxEnable(true));
+                    states[id].behaviour = moving;
+                    goto case moving;
+                case idle, doorOpen:
+                    writeln("\n    WARN: Arrived at floor with behaviour ", states[id].behaviour, "\n");
+                    motorDirection(Dirn.stop);
+                    break;
+                }
+                states[id].floor = f;
+            },
+            (DoorClose d){
+                writeln("\n  Event: ", d);
+                final switch(states[id].behaviour) with(ElevatorBehaviour){
+                case doorOpen:
+                    doorLight(false);
+                    
+                    // TODO: check if we can call "moveIfOrdersAvailable"
+                    states[id].dirn = chooseDirection(
+                        optimalOrders(states, hallOrders, peers, id),
+                        states[id].floor,
+                        states[id].dirn
+                    );
+                    if(states[id].dirn != Dirn.stop){
+                        motorDirection(states[id].dirn);
+                        thisTid.addEvent(2*travelTimeEstimate, FloorArrivalTimeout());
+                        states[id].behaviour = moving;
+                    } else {
+                        states[id].behaviour = idle;
+                    }
+                    break;
+                case idle, moving, errStuckBetweenFloors:
+                    writeln("\n    WARN: door close with behaviour ", states[id].behaviour, "\n");
+                    break;
+                }
+            },
+            (NewConfirmedHallOrder n){
+                writeln("\n  Event: ", n);
+                final switch(states[id].behaviour) with(ElevatorBehaviour){
+                case idle:
+                    if(states[id].floor == n.floor){
+                        auto orders = optimalOrders(states, hallOrders, peers, id);
+                        if(shouldStop(orders, n.floor, states[id].dirn)){   // TODO: always returns true, because dirn == stop
+                            //motorDirection(Dirn.stop);
+                            doorLight(true);
+
+                            clearAt(orders, n.floor, (Call c){
+                                final switch(c) with(Call){
+                                case hallUp, hallDown:
+                                    hallOrders[n.floor][c].state = HallOrderState.inactive;
+                                    hallOrders[n.floor][c].ackdBy.destroy;
+                                    debug(hallOrders){
+                                        writeln(" Cleared order (idle): ", n.floor, " ", c);
+                                        hallOrders.print;
+                                    }
+                                    break;
+                                case cab:
+                                    break;
+                                }
+                            });
+
+                            thisTid.addEvent(doorOpenDuration, DoorClose());
+                            states[id].behaviour = doorOpen;
+                        } else {
+                            // Someone else is taking this order, do nothing.
+                        }
+                    } else {
+                        callButtonLight(n.floor, n.call, true);
+                        // TODO: call "moveIfOrdersAvailable"
+                        states[id].dirn = chooseDirection(
+                            optimalOrders(states, hallOrders, peers, id),
+                            states[id].floor,
+                            states[id].dirn
+                        );
+                        if(states[id].dirn != Dirn.stop){
+                            motorDirection(states[id].dirn);
+                            thisTid.addEvent(2*travelTimeEstimate, FloorArrivalTimeout());
+                            states[id].behaviour = moving;
+                        } else {
+                            // Someone else is taking this order, do nothing.
+                        }
+                    }
+                    break;
+
+                case moving, errStuckBetweenFloors:
+                    callButtonLight(n.floor, n.call, true);
+                    break;
+
+                case doorOpen:
+                    if(states[id].floor == n.floor){
+                        thisTid.deleteEvent(typeid(DoorClose), Delete.all);
+                        thisTid.addEvent(doorOpenDuration, DoorClose());
+
+                        auto orders = optimalOrders(states, hallOrders, peers, id);
+                        clearAt(orders, n.floor, (Call c){
+                            final switch(c) with(Call){
+                            case hallUp, hallDown:
+                                hallOrders[n.floor][c].state = HallOrderState.inactive;
+                                hallOrders[n.floor][c].ackdBy.destroy;
+                                debug(hallOrders){
+                                    writeln(" Cleared order (idle): ", n.floor, " ", c);
+                                    hallOrders.print;
+                                }
+                                break;
+                            case cab:
+                                break;
+                            }
+                        });
+                    } else {
+                        callButtonLight(n.floor, n.call, true);
+                    }
+                    break;
+                }
+            },
+
+
+
+            // --- Broadcast messages --- ///
+
+            (HallOrderMsg h){
+                HallOrder[2][] recvdOrders = h.orders;
+
+                debug(hallOrders){
+                    bool printUpdatedTable = false;
+                    if(recvdOrders != hallOrders){
+                        printUpdatedTable = true;
+                        writeln("\n  Event: Different HallOrderMsg from id:", h.owner);
+                        recvdOrders.print;
+                        //writeln(" Current table:");
+                        //hallOrders.print;
+                    }
+                }
+
+                foreach(int floor, ref a; hallOrders){
+                    foreach(call, ref order; a){
+                        HallOrder other = recvdOrders[floor][call];
+                        //writeln(floor, " ", call, " ", other);
+
+                        final switch(order.state) with(HallOrderState){
+                        case unknown:
+                            final switch(other.state) with(HallOrderState){
+                            case unknown:
+                                // Never transition to unknown
+                                break;
+                            case inactive:
+                                order.state = inactive;
+                                order.ackdBy.destroy;
+                                break;
+                            case pendingAck:
+                                order.state = pendingAck;
+                                order.ackdBy = other.ackdBy ~ [id];
+                                break;
+                            case confirmed:
+                                order.state = confirmed;
+                                order.ackdBy = other.ackdBy ~ [id];
+                                break;
+                            }
+                            break;
+
+                        case inactive:
+                            final switch(other.state) with(HallOrderState){
+                            case unknown:
+                                // Never transition to unknown
+                                break;
+                            case inactive:
+                                // Same state as us: ignore
+                                break;
+                            case pendingAck:
+                                order.state = pendingAck;
+                                order.ackdBy = other.ackdBy ~ [id];
+                                break;
+                            case confirmed:
+                                // Cannot transition backward
+                                break;
+                            }
+                            break;
+
+                        case pendingAck:
+                            final switch(other.state) with(HallOrderState){
+                            case unknown:
+                                // Never transition to unknown
+                                break;
+                            case inactive:
+                                // Cannot transition backward
+                                break;
+                            case pendingAck:
+                                order.ackdBy ~= other.ackdBy ~ [id];
+                                if(peers.setDifference(order.ackdBy.sort()).empty){
+                                    order.state = confirmed;
+                                    // TODO: make fn instead of self-transition
+                                    thisTid.send(NewConfirmedHallOrder(floor, cast(Call)call));
+                                }
+                                break;
+                            case confirmed:
+                                order.state = confirmed;
+                                thisTid.send(NewConfirmedHallOrder(floor, cast(Call)call));
+                                order.ackdBy ~= other.ackdBy ~ [id];
+                                break;
+                            }
+                            break;
+
+                        case confirmed:
+                            final switch(other.state) with(HallOrderState){
+                            case unknown:
+                                // Never transition to unknown
+                                break;
+                            case inactive:
+                                order.state = inactive;
+                                order.ackdBy.destroy;
+                                callButtonLight(floor, cast(Call)call, false);
+                                break;
+                            case pendingAck:
+                                // Cannot transition backward
+                                break;
+                            case confirmed:
+                                order.ackdBy ~= other.ackdBy ~ [id];
+                                break;
+                            }
+                            break;
+                        }
+
+                        order.ackdBy = order.ackdBy.sort().uniq.array;
+
+                    }
+                }
+                debug(hallOrders){
+                    if(printUpdatedTable  ||  recvdOrders != hallOrders){
+                        writeln(" Updated:");
+                        hallOrders.print;
+                    }
+                }
+            },
+            (BroadcastHallOrders b){
+                thisTid.addEvent(
+                    uniform(bcastHallOrdersPeriodMin_ms, bcastHallOrdersPeriodMax_ms).msecs,
+                    BroadcastHallOrders()
+                );
+                bcast.send(HallOrderMsg(id, hallOrders));
+            },
+            (ElevatorStateMsg e){
+                if(e.id != id){
+                    auto other = cast(ElevatorState)e.state;
+                    if(e.id !in states  ||  states[e.id] != other){
+                        writeln("\n  Event: ", e);
+                        if(states[id].behaviour == ElevatorBehaviour.idle){
+                            // TODO: call "moveIfOrdersAvailable"
+                            final switch(states[id].behaviour) with(ElevatorBehaviour){
+                            case idle:
+                                states[id].dirn = chooseDirection(
+                                    optimalOrders(states, hallOrders, peers, id),
+                                    states[id].floor,
+                                    states[id].dirn
+                                );
+                                if(states[id].dirn != Dirn.stop){
+                                    motorDirection(states[id].dirn);
+                                    thisTid.addEvent(2*travelTimeEstimate, FloorArrivalTimeout());
+                                    states[id].behaviour = moving;
+                                } else {
+                                    // Either no order, or someone else is taking it
+                                }
+                                break;
+                            case moving, doorOpen, errStuckBetweenFloors:
+                                break;
+                            }
+                            writeln("TODO: Do something?");
+                        }
+                    }
+                    states[e.id] = cast(ElevatorState)e.state;
+                }
+            },
+            (BroadcastState b){
+                bcast.send(ElevatorStateMsg(states[id], id));
+            },
+            (PeerList p){
+                writeln("\n  Event: PeerList(", p, ")");
+                peers = p.peers.dup.sort().array;
+
+                // TODO: make fn: "moveIfOrdersAvailable"
+                final switch(states[id].behaviour) with(ElevatorBehaviour){
+                case idle:
+                    states[id].dirn = chooseDirection(
+                        optimalOrders(states, hallOrders, peers, id),
+                        states[id].floor,
+                        states[id].dirn
+                    );
+                    if(states[id].dirn != Dirn.stop){
+                        motorDirection(states[id].dirn);
+                        thisTid.addEvent(2*travelTimeEstimate, FloorArrivalTimeout());
+                        states[id].behaviour = moving;
+                    } else {
+                        // Either no order, or someone else is taking it
+                    }
+                    break;
+                case moving, doorOpen, errStuckBetweenFloors:
+                    break;
+                }
+
+
+            },
+
+
+
+            // --- Timeout errors --- //
+
+            (FloorArrivalTimeout f){
+                writeln("\n  Event: ", f);
+                peerTx.send(TxEnable(false));
+                states[id].behaviour = ElevatorBehaviour.errStuckBetweenFloors;
+            },
+
+
+
+            // --- State restore --- //
+
+            (StateRestoreRequest s){
+                writeln("\n    Event: ", s);
+                if(s.asker in states){
+                    bcast.send(StateRestoreInfo(states[s.asker], s.asker));
+                }
+            },
+            (StateRestoreInfo s){
+                if(s.belongsTo == id){
+                    writeln("\n    Event: ", s);
+                    if(s.state.cabOrders.length == states[id].cabOrders.length){
+                        states[id].cabOrders = states[id].cabOrders.zip(cast(bool[])s.state.cabOrders)
+                            .map!(a => a[0] || a[1])
+                            .array;
+                        foreach(int f, a; states[id].cabOrders){
+                            callButtonLight(f, Call.cab, a);
+                        }
+                    }
+                }
+            },
+
+            (Variant v){
+                writeln("Main received: ", v);
+            }
+        );
+    }
+}
+
+unittest {
+    writeln("\n\n     ------  TEST 1  -----\n\n");
+    with(ElevatorBehaviour){
+    with(HallOrderState){
+    ElevatorState[ubyte] states = [
+        1 : ElevatorState(idle,       0, Dirn.stop,   [0, 0, 0, 0].to!(bool[])),
+        2 : ElevatorState(doorOpen,   1, Dirn.down,   [1, 0, 0, 0].to!(bool[])),
+        3 : ElevatorState(moving,     2, Dirn.up,     [1, 0, 0, 1].to!(bool[])),
+    ];
+
+    HallOrder[2][] hallOrders = [
+        [HallOrder(inactive,    []),        HallOrder(inactive,     []),            ],
+        [HallOrder(confirmed,   [1, 2]),    HallOrder(inactive,     []),            ],
+        [HallOrder(inactive,    []),        HallOrder(pendingAck,   [1, 2, 3]),     ],
+        [HallOrder(inactive,    []),        HallOrder(inactive,     []),            ],
+    ];
+
+    ubyte[] peers = [1, 2, 3];
+
+    ubyte id = 1;
+
+    writefln("\nFinal result:\n%(  %(%d, %)\n%)\n", optimalOrders(states, hallOrders, peers, id));
+    }}
+}
+
+unittest {
+    writeln("\n\n     ------  TEST 2.1  -----\n\n");
+    with(ElevatorBehaviour){
+    with(HallOrderState){
+    ElevatorState[ubyte] states = [
+        1 : ElevatorState(idle,       0, Dirn.stop,   [0, 0, 0, 0].to!(bool[])),
+        2 : ElevatorState(idle,       3, Dirn.stop,   [0, 0, 0, 0].to!(bool[])),
+    ];
+
+    HallOrder[2][] hallOrders = [
+        [HallOrder(inactive,    []),        HallOrder(inactive,     []),            ],
+        [HallOrder(inactive,    []),        HallOrder(confirmed,    [1, 2]),        ],
+        [HallOrder(confirmed,   [1, 2]),    HallOrder(inactive,     []),            ],
+        [HallOrder(inactive,    []),        HallOrder(inactive,     []),            ],
+    ];
+
+    ubyte[] peers = [1, 2];
+
+    ubyte id = 1;
+
+    auto optimal = optimalOrders(states, hallOrders, peers, id);
+    assert(!optimal[2][Call.hallUp]);
+    assert(optimal[1][Call.hallDown]);
+    
+    writeln("\n\n     ------  TEST 2.2  -----\n\n");
+    states = [
+        1 : ElevatorState(moving,     0, Dirn.up,     [0, 0, 0, 0].to!(bool[])),    // only change
+        2 : ElevatorState(idle,       3, Dirn.stop,   [0, 0, 0, 0].to!(bool[])),
+    ];
+    
+    optimal = optimalOrders(states, hallOrders, peers, id);
+    assert(!optimal[2][Call.hallUp]);
+    assert(optimal[1][Call.hallDown]);
+    
+    }}
+}
+
+
+
+bool[3][] optimalOrders(ElevatorState[ubyte] states, HallOrder[2][] hallOrders, ubyte[] peers, ubyte id, Flag!"arriving" arriving = No.arriving){
+    debug(optimalOrders) writeln("\n\n  ---- optimalOrders start ----\n");
+
+    /// Assertions ///
+    auto floors = hallOrders.length;
+    foreach(state; states){
+        assert(state.cabOrders.length == floors);
+    }
+    assert(id in states);
+    if(arriving){
+        assert(states[id].behaviour == ElevatorBehaviour.moving);
+    }
+
+
+    /// Types ///
+    struct HOrd {
+        bool        active;
+        ubyte       visitedBy;
+        Duration    visitTime;
+    }
+    struct State {
+        ubyte           id;
+        ElevatorState   state;
+        Duration        time;
+    }
+
+
+    bool[3][] combineUnvisited(bool[] cabOrders, HOrd[2][] hOrds){
+        return hOrds.zip(cabOrders)
+            .map!(a => a[0].array.map!(a => a.active && a.visitedBy == 0).array ~ a[1])
+            .array.to!(bool[3][]);
+    }
+
+    bool[3][] combineAssignedAndUnvisited(bool[] cabOrders, HOrd[2][] hOrds, ubyte id){
+        return hOrds.zip(cabOrders)
+            .map!(a =>
+                a[0].array.map!(a =>
+                    (a.visitedBy == id) || (a.active && a.visitedBy == 0)
+                ).array ~ a[1]
+            )
+            .array.to!(bool[3][]);
+    }
+
+    /// Initialize data ///
+    auto ineligibleBehaviours = [ElevatorBehaviour.errStuckBetweenFloors];
+
+    State[] ss = states.keys.zip(states.values)
+        .filter!(a => (peers.canFind(a[0]) || a[0] == id) && !ineligibleBehaviours.canFind(a[1].behaviour))
+        .map!(a => State(
+            a[0],
+            ElevatorState(a[1].behaviour, a[1].floor, a[1].dirn, a[1].cabOrders.dup),
+            a[0].usecs    // So no two elevators claim "the other one is taking it"
+        ))
+        .array;
+    debug(optimalOrders) writefln("Eligible states:\n%(  %s\n%)", ss);
+
+    HOrd[2][] hos = new HOrd[2][](floors);
+    foreach(f, a; hallOrders){
+        foreach(c, order; a){
+            hos[f][c] = HOrd(
+                order.state == HallOrderState.confirmed,
+                0,
+                0.msecs,
+            );
+        }
+    }
+    debug(optimalOrders) writefln("Hall orders:\n%(  %(%s, %)\n%))", hos);
+
+
+
+
+
+    /// Distribute orders ///
+
+    // Perform initial move:
+    foreach(ref s; ss){
+        final switch(s.state.behaviour) with(ElevatorBehaviour){
+        case doorOpen:
+            // Hold the door open the "remaining" doorOpenDuration (on "average" half the time remains)
+            s.time += doorOpenDuration/2;
+            goto case idle;
+        case idle:
+            // Visit & clear hall orders where the door is open or can be opened
+            foreach(c; 0..2){
+                if(hos[s.state.floor][c].active){
+                    hos[s.state.floor][c].visitedBy = s.id;
+                    hos[s.state.floor][c].visitTime = s.time;
+                    s.time += doorOpenDuration;
+                }
+            }
+            break;
+        case moving:
+            if(s.id == id && arriving){
+                // If we are arriving, we do not travel further
+            } else {
+                // Otherwise, we move to the next floor (on "average" half the travel time remains)
+                s.state.floor += s.state.dirn;
+                s.time += travelTimeEstimate/2;
+            }
+            break;
+        case errStuckBetweenFloors:
+            assert(0);
+        }
+    }
+    
+    debug(optimalOrders){
+        writeln("\nAfter initial move:");
+        writefln("States:\n%(  %s\n%)", ss);
+        writefln("Hall orders:\n%(  %(%s, %)\n%))", hos);
+    }
+
+    while(true){
+        debug(optimalOrders) writeln("\n");
+
+        // Done if all orders are visited
+        bool done = true;
+        // Shortcircuit: If all unvisited hall orders are at floors where there
+        // is an elevator with no cab orders, assign to those, done
+        bool allUnvisitedAreImmediatelyAssignable = true;
+
+        foreach(f, a; hos){
+            foreach(c, order; a){
+                if(order.active && order.visitedBy == 0){
+                    done = false;
+                    if(ss.filter!(a => !a.state.cabOrders.any && a.state.floor == f).empty){
+                        allUnvisitedAreImmediatelyAssignable = false;
+                    }
+                }
+            }
+        }
+        if(allUnvisitedAreImmediatelyAssignable){
+            debug(optimalOrders) writeln("Can immediately assign remaining unvisited orders\n");
+            foreach(f, a; hos){
+                foreach(c, order; a){
+                    if(order.active && order.visitedBy == 0){
+                        foreach(ref s; ss){
+                            if(!s.state.cabOrders.any && s.state.floor == f){
+                                hos[f][c].visitedBy = s.id;
+                                hos[f][c].visitTime = s.time;
+                                s.time += doorOpenDuration;
+                            }
+                        }
+                    }
+                }
+            }
+            done = true;
+        }
+        if(done){
+            break;
+        }
+
+
+
+
+        // Find s = state with shortest time
+        ss.sort!("a.time < b.time")();
+        debug(optimalOrders){
+            writefln("States:\n%(  %s\n%)", ss);
+            writefln("Hall orders:\n%(  %(%s, %)\n%))\n", hos);
+        }
+
+
+        // Advance s one time-step: either move, or stop for passengers
+
+        bool[3][] orders = combineUnvisited(ss[0].state.cabOrders, hos);
+
+        final switch(ss[0].state.behaviour) with(ElevatorBehaviour){
+        case moving:
+            if(shouldStop(orders, ss[0].state.floor, ss[0].state.dirn)){
+                debug(optimalOrders) writeln("Stopping");
+                ss[0].state.behaviour = ElevatorBehaviour.doorOpen;
+                clearAt(orders, ss[0].state.floor, (Call c){
+                    final switch(c) with(Call){
+                    case hallUp, hallDown:
+                        hos[ss[0].state.floor][c].visitedBy = ss[0].id;
+                        hos[ss[0].state.floor][c].visitTime = ss[0].time;
+                        debug(optimalOrders) writeln("Clear hall order: ", ss[0].state.floor, " ", c, ", ", hos[ss[0].state.floor][c]);
+                        break;
+                    case cab:
+                        ss[0].state.cabOrders[ss[0].state.floor] = false;
+                        break;
+                    }
+                });
+                ss[0].time += doorOpenDuration;
+            } else {
+                debug(optimalOrders) writeln("Moving further");
+                ss[0].state.floor += ss[0].state.dirn;
+                ss[0].time += travelTimeEstimate;
+            }
+            break;
+        case idle, doorOpen:
+            Dirn d = chooseDirection(orders, ss[0].state.floor, ss[0].state.dirn);
+            ss[0].state.dirn = d;
+            if(d != Dirn.stop){
+                debug(optimalOrders) writeln("Starting to move ", d);
+                ss[0].state.behaviour = ElevatorBehaviour.moving;
+                ss[0].state.floor += ss[0].state.dirn;
+                ss[0].time += travelTimeEstimate;
+            } else {
+                debug(optimalOrders) writeln("Going idle");
+                ss[0].state.behaviour = ElevatorBehaviour.idle;
+            }
+            break;
+        case errStuckBetweenFloors:
+            assert(0);
+        }
+
+        debug(optimalOrders) writeln("New state: \n  ", ss[0]);
+
+
+
+
+
+    }
+
+
+
+    // Return //
+    bool[2][] h = new bool[2][](floors);
+    foreach(floor, a; hos){
+        foreach(call, order; a){
+            h[floor][call] = order.visitedBy == id;
+        }
+    }
+    bool[3][] r = states[id].cabOrders.combineHallOrders(h);
+
+    debug(optimalOrders) writefln("Initial states:\n%(  %s : %s\n%)", states);
+    debug(optimalOrders) writefln("Final states:\n%(  %s\n%)", ss);
+    debug(optimalOrders) writefln("Final hall orders:\n%(  %(%s, %)\n%))", hos);
+    debug(optimalOrders) writefln("Final result:\n%(  %(%d, %)\n%)\n", r);
+    debug(optimalOrders) writeln("  ---- optimalOrders end ----\n");
+    
+    return r;
+
+
+
+    // Return all hall orders
+    /+
+    bool[2][] h = new bool[2][](hallOrders.length);
+    foreach(floor, a; hallOrders){
+        foreach(call, order; a){
+            h[floor][call] = order.state == HallOrderState.confirmed;
+        }
+    }
+    return states[id].cabOrders.combineHallOrders(h);
+    +/
+}
+
+
+
+bool[3][] combineHallOrders(bool[] cabOrders, bool[2][] hallOrders){
+    assert(cabOrders.length == hallOrders.length);
+
+    return hallOrders.zip(cabOrders)
+            .map!(a => a[0] ~ a[1])
+            .array.to!(bool[3][]);
+}
+
+
